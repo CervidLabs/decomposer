@@ -1,0 +1,9 @@
+*.py
+*.txt
+node_modules/
+dist/
+test_data
+test_files
+*.npy
+*.parquet
+test/

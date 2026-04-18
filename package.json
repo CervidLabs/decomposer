@@ -1,0 +1,43 @@
+{
+  "name": "@cervid/decomposer",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "keywords": [
+    "npy",
+    "parquet",
+    "arrow",
+    "binary-data",
+    "sharedarraybuffer",
+    "data-ingestion",
+    "columnar",
+    "high-performance",
+    "nodejs",
+    "data-processing"
+  ],
+  "author": {
+    "name": "Aldair Beltran",
+    "email": "support@cervid.io"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}

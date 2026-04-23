@@ -391,11 +391,20 @@ export function decodePage(
   const nullVal = nullValue(type);
 
   // Helper interno para escribir valores de forma tipada
-  const writeValue = (val: string | number | null) => {
+  // FIX: acepta undefined para robustez (antes undefined no coincidía
+  // con ninguna rama y written no se incrementaba, produciendo 0 filas).
+  const writeValue = (val: string | number | null | undefined) => {
     if (Array.isArray(out)) {
-      out[outPos + written++] = val === null ? 'null' : String(val);
-    } else if (typeof val === 'number' || val === null) {
-      out[outPos + written++] = val ?? (nullVal as number);
+      if (val === null || val === undefined) {
+        out[outPos + written++] = 'null';
+      } else {
+        out[outPos + written++] = String(val);
+      }
+    } else if (val === null || val === undefined) {
+      // null o undefined → centinela (NaN para float, 0 para int)
+      out[outPos + written++] = (nullVal ?? 0);
+    } else {
+      out[outPos + written++] = val as number;
     }
   };
 

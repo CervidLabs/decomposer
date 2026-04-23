@@ -10,6 +10,7 @@ import { CervidNavigator } from './core/CervidNavigator.js';
 import * as spec from './lib/spec.js';
 import type { DecomposterDType, ColumnSchema, ArrayColumn, StringColumn, TableResult } from './lib/spec.js';
 
+// Configuración de rutas para ESModules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const WORKER_PATH = path.join(__dirname, 'workers', 'extractor.worker.js');
@@ -51,8 +52,6 @@ interface WorkerMessage {
   status: 'DONE' | 'ERROR';
   data: Int32Array | Float64Array | Float32Array | Uint8Array | string[];
   type: string;
-  encoding: string;
-  compression: string;
   rowCount: number;
 }
 
@@ -81,7 +80,9 @@ function normalizeColumnToShared(
   col: Int32Array | Float64Array | Float32Array | Uint8Array | string[],
   dtype: DecomposterDType,
 ): ArrayColumn | StringColumn {
-  if (!Array.isArray(col)) {return spec.toSharedTypedArrayColumn(dtype, col);}
+  if (!Array.isArray(col)) {
+    return spec.toSharedTypedArrayColumn(dtype, col);
+  }
   return spec.makeStringColumn(col);
 }
 
@@ -90,20 +91,48 @@ function buildSharedColumns(
   fullSchema: ColumnSchema[],
 ): Record<string, ArrayColumn | StringColumn> {
   const out: Record<string, ArrayColumn | StringColumn> = {};
+
   for (const s of fullSchema) {
     const col = columns[s.name];
-    if (col === null || col === undefined) {continue;}
+    if (col === null) {continue;}
     out[s.name] = normalizeColumnToShared(col, s.dtype);
   }
+
   return out;
 }
 
 function formatValue(v: unknown): string {
-  if (v === null || v === undefined) {return 'null';}
-  if (typeof v === 'number') {return !Number.isFinite(v) ? 'NaN' : v.toString();}
-  if (typeof v === 'bigint') {return v.toString();}
-  if (typeof v === 'boolean') {return v ? 'true' : 'false';}
-  if (typeof v === 'string') {return v;}
+  // 1. Filtrar nulos y undefined
+  if (v === null || v === undefined) {
+    return 'null';
+  }
+
+  // 2. Manejar números (incluyendo NaN e Infinity)
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) {return 'NaN';}
+    return v.toString();
+  }
+
+  // 3. Manejar BigInt (común en columnas INT64 de Parquet)
+  if (typeof v === 'bigint') {
+    return v.toString();
+  }
+
+  // 4. Manejar Booleanos
+  if (typeof v === 'boolean') {
+    return v ? 'true' : 'false';
+  }
+
+  // 5. Manejar Strings (evita procesar objetos si ya es string)
+  if (typeof v === 'string') {
+    return v;
+  }
+
+  /**
+   * 6. Caso final para objetos/arrays:
+   * Si llegamos aquí, v es un objeto. Usamos JSON.stringify para evitar 
+   * el error de '@typescript-eslint/no-base-to-string'.
+   */
   if (typeof v === 'object') {
     try {
       return JSON.stringify(v);
@@ -111,23 +140,14 @@ function formatValue(v: unknown): string {
       return '[Complex Object]';
     }
   }
+
+  // Fallback seguro para cualquier otro tipo primitivo raro (como Symbols)
   return JSON.stringify(v);
 }
-
 // ── Orquestación de workers ────────────────────────────────────────────────
 
-async function readRowGroup(
-  rowGroup: RowGroup,
-  fileBuffer: ArrayBufferLike,
-  options: { sample?: boolean },
-  totalRowCount: number, // ← fallback si numRows = 0
-): Promise<WorkerMessage[]> {
+async function readRowGroup(rowGroup: RowGroup, fileBuffer: ArrayBufferLike, options: { sample?: boolean }): Promise<WorkerMessage[]> {
   const sampleOnly = !!options.sample;
-
-  // ── FIX: numRows = 0 silencioso ──────────────────────────────────────────
-  // ThriftReader puede parsear numRows = 0 si el field 3 del RowGroup no fue
-  // leído correctamente. Fallback al rowCount total del archivo.
-  const numRows = rowGroup.numRows > 0 ? rowGroup.numRows : totalRowCount;
 
   const promises = rowGroup.columns.map(
     async (col) =>
@@ -142,7 +162,7 @@ async function readRowGroup(
           compression: col.compression,
           encoding: col.encoding,
           type: col.type,
-          numRows,
+          numRows: rowGroup.numRows,
           dictOffset: col.dictOffset,
           sampleOnly,
         });
@@ -152,23 +172,18 @@ async function readRowGroup(
             void worker.terminate();
             resolve(msg);
           } else {
-            void worker.terminate();
-            reject(new Error(`Worker error — column "${col.name}": status=${msg.status}`));
+            void worker.terminate().catch(() => {
+              // cleanup error intentionally ignored
+            });
+            reject(new Error(`Worker failed for column ${col.name}`));
           }
         });
 
         worker.on('error', (err) => {
-          void worker.terminate();
-          reject(new Error(`[${col.name}] worker error: ${err.message}`));
-        });
-
-        // ── FIX: manejar salida inesperada del worker ──────────────────────
-        // Sin este handler, si el worker crashea antes de postMessage, la
-        // Promise nunca resuelve y Promise.all cuelga indefinidamente.
-        worker.on('exit', (code) => {
-          if (code !== 0) {
-            reject(new Error(`[${col.name}] worker exited with code ${code}`));
-          }
+          void worker.terminate().catch(() => {
+            // cleanup error intentionally ignored
+          });
+          reject(new Error(`[${col.name}] ${err.message}`));
         });
       }),
   );
@@ -179,7 +194,9 @@ async function readRowGroup(
 // ── Fusión de row groups ────────────────────────────────────────────────────
 
 type DecomposerColumnData = Int32Array | Float64Array | Float32Array | Uint8Array | string[];
+
 type SupportedTypedArray = Int32Array | Float64Array | Float32Array | Uint8Array;
+
 interface TypedArrayConstructor {
   new (length: number): SupportedTypedArray;
 }
@@ -215,42 +232,49 @@ function mergeRowGroups(allResults: WorkerMessage[][]): Record<string, Decompose
 // ── ParquetReader ───────────────────────────────────────────────────────────
 
 export const ParquetReader = {
+  /**
+   * Convierte un archivo Parquet a un resultado columnar tipado.
+   * Si inspect=true, además devuelve metadata y resumen tipo scanner.
+   */
   async convert(filePath: string, options: ParquetReadOptions = {}): Promise<TableResult | ParquetInspectionResult> {
     // 1. Escaneo de footer
     const nav = new CervidNavigator(filePath);
     nav.scanFooter();
 
     const metadata = nav.metadata;
-    if (!metadata) {throw new Error('Failed to read Parquet metadata');}
+    if (!metadata) {
+      throw new Error('Failed to read Parquet metadata');
+    }
 
-    let schemaElements = metadata.schema.slice(1);
+    let schemaElements = metadata.schema.slice(1); // saltar raíz
     let rowGroups = metadata.rowGroups as RowGroup[];
     const rowCount = metadata.rowCount;
 
     // 2. Proyección de columnas
     if (options.columns && options.columns.length > 0) {
       const selected = new Set(options.columns.map((c) => c.toLowerCase()));
+
       rowGroups = rowGroups.map((rg) => ({
         ...rg,
         columns: rg.columns.filter((col) => selected.has(col.name.toLowerCase())),
       }));
+
       schemaElements = schemaElements.filter((s) => selected.has(s.name.toLowerCase()));
     }
 
     // 3. Procesamiento por row group
     const allResults: WorkerMessage[][] = [];
     for (const rg of rowGroups) {
-      const rgResults = await readRowGroup(rg, nav.fileBuffer!, options, rowCount);
+      const rgResults = await readRowGroup(rg, nav.fileBuffer!, options);
       allResults.push(rgResults);
     }
 
     // 4. Merge de datos
-    const rawColumns: Record<string, Int32Array | Float64Array | Float32Array | Uint8Array | string[]> =
+    const columns =
       allResults.length === 1
         ? allResults[0].reduce(
             (acc, msg) => {
-              // ── FIX: ignorar mensajes con data nulo/vacío de forma defensiva ──
-              if (msg.data !== null || msg.data !== undefined) {acc[msg.id] = msg.data;}
+              acc[msg.id] = msg.data;
               return acc;
             },
             {} as Record<string, Int32Array | Float64Array | Float32Array | Uint8Array | string[]>,
@@ -260,45 +284,34 @@ export const ParquetReader = {
     // 5. Construcción de esquema final
     const firstRGCols = metadata.rowGroups[0]?.columns ?? [];
 
-    // Build a map for O(1) lookup — also handles name casing differences
-    const rgColMap = new Map(firstRGCols.map((c) => [c.name.toLowerCase(), c]));
-
     const outSchema = schemaElements.map((s) => {
-      const rgInfo = rgColMap.get(s.name.toLowerCase()) ?? {
+      const rgInfo = firstRGCols.find((c) => c.name === s.name) ?? {
         encoding: 'PLAIN',
         compression: 'UNCOMPRESSED',
-        type: s.type ?? 'UNKNOWN',
       };
 
       const dtype = spec.mapParquetType(s.type ?? 'UNKNOWN');
 
-      // Anidar bajo 'meta' para que col.meta?.encoding funcione en el scanner.
-      // makeSchemaColumn usa spread (...extra), así que las propiedades de top-level
-      // se añaden directamente al objeto. Nesting bajo 'meta' las agrupa correctamente.
       return spec.makeSchemaColumn(s.name, dtype, {
-        meta: {
-          parquetType: s.type ?? undefined,
-          encoding: rgInfo.encoding,
-          compression: rgInfo.compression,
-        },
+        parquetType: s.type,
+        encoding: rgInfo.encoding,
+        compression: rgInfo.compression,
       });
     });
 
-    const outColumns = buildSharedColumns(rawColumns, outSchema);
+    const outColumns = buildSharedColumns(columns, outSchema);
 
-    const table = spec.createTableResult(filePath, rowCount, outSchema, outColumns, {
-      rowGroups: rowGroups.length,
-    });
+    const table = spec.createTableResult(filePath, rowCount, outSchema, outColumns, { rowGroups: rowGroups.length });
 
-    if (!options.inspect) {return table;}
+    if (!options.inspect) {
+      return table;
+    }
 
-    // 6. Resumen de inspección
     const summary: ParquetInspectionColumnSummary[] = outSchema.map((schemaCol) => {
       const meta = (schemaCol.meta ?? {}) as ParquetSchemaMeta;
 
-      // rawData: prefer raw worker output so we see the real column arrays
       const rawData =
-        rawColumns[schemaCol.name] ??
+        columns[schemaCol.name] ??
         (outColumns[schemaCol.name]
           ? (outColumns[schemaCol.name].data as Int32Array | Float64Array | Float32Array | Uint8Array | string[] | undefined)
           : undefined);
@@ -310,17 +323,26 @@ export const ParquetReader = {
         sample: [],
       };
 
-      if (meta.parquetType !== undefined) {result.parquetType = meta.parquetType;}
-      if (meta.encoding !== undefined) {result.encoding = meta.encoding;}
-      if (meta.compression !== undefined) {result.compression = meta.compression;}
+      if (meta.parquetType !== undefined) {
+        result.parquetType = meta.parquetType;
+      }
+      if (meta.encoding !== undefined) {
+        result.encoding = meta.encoding;
+      }
+      if (meta.compression !== undefined) {
+        result.compression = meta.compression;
+      }
 
-      if (rawData === null || rawData === undefined) {
+      if (rawData === null) {
         result.sample = ['[missing column data]'];
         return result;
       }
 
       result.length = rawData.length;
-      result.sample = Array.isArray(rawData) ? rawData.slice(0, 5).map(formatValue) : Array.from(rawData.slice(0, 5)).map(formatValue);
+
+      result.sample = Array.isArray(rawData)
+        ? rawData.slice(0, 5).map((v) => formatValue(v))
+        : Array.from(rawData.slice(0, 5)).map((v) => formatValue(v));
 
       return result;
     });
@@ -328,7 +350,11 @@ export const ParquetReader = {
     return {
       kind: 'parquet_inspection',
       filePath,
-      metadata: { rowCount, rowGroups: rowGroups.length, schema: outSchema },
+      metadata: {
+        rowCount,
+        rowGroups: rowGroups.length,
+        schema: outSchema,
+      },
       table,
       summary,
     };

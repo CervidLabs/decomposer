@@ -1,0 +1,37 @@
+name: CI @Cervid/data
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📂 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🛡️ Run Lint (Tolerancia Cero)
+        run: npm run lint
+            # Si hay cualquier error de lint, este paso fallará y detendrá el proceso.
+            # Esto asegura que el código siempre cumpla con nuestros estándares de estilo y calidad.
+      - name: 🔍 Security Audit
+        run: npm audit --audit-level=high
+        # Esto fallará solo si hay vulnerabilidades de nivel 'High' o 'Critical'.
+        # Es perfecto para ignorar los ruidos de nivel 'Moderate' que vimos antes.
+
+      - name: 🏗️ Build Project
+        run: npm run build
+        # Verifica que TypeScript pueda compilar todo el proyecto sin errores.

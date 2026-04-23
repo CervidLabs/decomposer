@@ -41,6 +41,7 @@ type EncodingStr =
   | 'DELTA_LENGTH_BYTE_ARRAY'
   | 'DELTA_BYTE_ARRAY'
   | 'RLE_DICTIONARY'
+  | 'BYTE_STREAM_SPLIT'
   | 'UNKNOWN';
 
 const EncodingMap: Record<number, EncodingStr> = {
@@ -53,9 +54,10 @@ const EncodingMap: Record<number, EncodingStr> = {
   6: 'DELTA_LENGTH_BYTE_ARRAY',
   7: 'DELTA_BYTE_ARRAY',
   8: 'RLE_DICTIONARY',
+  9: 'BYTE_STREAM_SPLIT',
 };
 
-type CompressionStr = 'UNCOMPRESSED' | 'SNAPPY' | 'GZIP' | 'LZO' | 'BROTLI' | 'LZ4' | 'ZSTD';
+type CompressionStr = 'UNCOMPRESSED' | 'SNAPPY' | 'GZIP' | 'LZO' | 'BROTLI' | 'LZ4' | 'ZSTD' | 'LZ4_RAW';
 
 const CompressionMap: Record<number, CompressionStr> = {
   0: 'UNCOMPRESSED',
@@ -65,9 +67,10 @@ const CompressionMap: Record<number, CompressionStr> = {
   4: 'BROTLI',
   5: 'LZ4',
   6: 'ZSTD',
+  7: 'LZ4_RAW',
 };
 
-// ── Interfaces de Metadatos ──────────────────────────────────────────────────
+// ── Interfaces ────────────────────────────────────────────────────────────────
 
 interface SchemaElement {
   name: string;
@@ -112,19 +115,26 @@ export interface FileMetaData {
   rowGroups: RowGroup[];
 }
 
-// ── ThriftReader Class ───────────────────────────────────────────────────────
+// ── ThriftReader ──────────────────────────────────────────────────────────────
 
 export class ThriftReader {
   private pos = 0;
   private readonly view: Uint8Array;
 
+  // Set to true before calling readFileMetaData() to get detailed position logs.
+  // REMOVE after debugging.
+  public debugMode = false;
+
   constructor(buffer: Uint8Array | Buffer) {
     this.view = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   }
 
-  // ── Primitivos Compact Protocol ──────────────────────────
+  // ── Primitives ───────────────────────────────────────────────────────────────
 
   private readByte(): number {
+    if (this.pos >= this.view.length) {
+      throw new Error(`readByte: position ${this.pos} out of bounds (buffer length ${this.view.length})`);
+    }
     return this.view[this.pos++];
   }
 
@@ -134,9 +144,7 @@ export class ThriftReader {
     while (true) {
       const byte = this.view[this.pos++];
       result |= (byte & 0x7f) << shift;
-      if ((byte & 0x80) === 0) {
-        break;
-      }
+      if ((byte & 0x80) === 0) {break;}
       shift += 7;
     }
     return result >>> 0;
@@ -153,9 +161,7 @@ export class ThriftReader {
     while (true) {
       const byte = BigInt(this.view[this.pos++]);
       result |= (byte & BigInt(0x7f)) << shift;
-      if ((byte & BigInt(0x80)) === BigInt(0)) {
-        break;
-      }
+      if ((byte & BigInt(0x80)) === BigInt(0)) {break;}
       shift += BigInt(7);
     }
     const decoded = (result >> BigInt(1)) ^ -(result & BigInt(1));
@@ -163,7 +169,6 @@ export class ThriftReader {
   }
 
   private readDouble(): number {
-    // Usamos DataView para leer doubles de forma portable sin dependencias de Buffer.readDoubleLE
     const dv = new DataView(this.view.buffer, this.view.byteOffset + this.pos, 8);
     this.pos += 8;
     return dv.getFloat64(0, true);
@@ -171,27 +176,33 @@ export class ThriftReader {
 
   private readBinary(): string {
     const len = this.readVarint();
+    // Guard: if len is absurdly large, the position is wrong.
+    if (len > 65536) {
+      throw new Error(
+        `readBinary: suspicious length ${len} at pos ${this.pos - 1} — ` +
+          `likely a position misalignment. Next 8 raw bytes: ` +
+          `[${Array.from(this.view.subarray(this.pos, this.pos + 8))
+            .map((b) => '0x' + b.toString(16))
+            .join(', ')}]`,
+      );
+    }
     const start = this.pos;
     this.pos += len;
     return new TextDecoder().decode(this.view.subarray(start, start + len));
   }
 
-  // ── Manejo de Campos ─────────────────────────────────────
+  // ── Field Headers ─────────────────────────────────────────────────────────────
 
   private readFieldHeader(lastFieldId: number): { type: CompactType; id: number } {
-    const byte = this.readByte(); // Cast aquí
-    // CompactType.STOP es 0, así que si byte es 0, es el fin de la estructura.
-    if (byte === 0) {
-      // Siendo honestos, en un parser de bytes, 0 es 0.
-      return { type: CompactType.STOP, id: -1 };
-    }
-
+    const byte = this.readByte();
+    if (byte === 0) {return { type: CompactType.STOP, id: -1 };}
     const delta = (byte >> 4) & 0x0f;
     const type = byte & 0x0f;
     const fieldId = delta === 0 ? this.readZigZag32() : lastFieldId + delta;
-
     return { type, id: fieldId };
   }
+
+  // ── Skip Utilities ────────────────────────────────────────────────────────────
 
   public skipValue(type: CompactType): void {
     switch (type) {
@@ -211,9 +222,11 @@ export class ThriftReader {
       case CompactType.DOUBLE:
         this.pos += 8;
         break;
-      case CompactType.BINARY:
-        this.pos += this.readVarint();
+      case CompactType.BINARY: {
+        const len = this.readVarint();
+        this.pos += len;
         break;
+      }
       case CompactType.STRUCT:
         this.skipStruct();
         break;
@@ -240,6 +253,13 @@ export class ThriftReader {
         }
         break;
       }
+      default:
+        // Unknown type — log a warning but don't crash.
+        // This signals a position misalignment or unsupported Thrift type.
+        if (this.debugMode) {
+          console.warn(`[ThriftReader] skipValue: unrecognized type ${type} at pos ${this.pos}`);
+        }
+        break;
     }
   }
 
@@ -247,15 +267,13 @@ export class ThriftReader {
     let lastId = 0;
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       this.skipValue(type);
     }
   }
 
-  // ── Helpers de Colecciones ───────────────────────────────
+  // ── List reader ───────────────────────────────────────────────────────────────
 
   private readList<T>(readItem: (type: CompactType) => T): T[] {
     const header = this.readByte();
@@ -268,16 +286,14 @@ export class ThriftReader {
     return items;
   }
 
-  // ── Métodos de Lectura de Parquet ────────────────────────
+  // ── FileMetaData ──────────────────────────────────────────────────────────────
 
   public readFileMetaData(): FileMetaData {
     const meta: FileMetaData = { version: 0, schema: [], rowCount: 0, rowGroups: [] };
     let lastId = 0;
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       switch (id) {
         case 1:
@@ -299,14 +315,14 @@ export class ThriftReader {
     return meta;
   }
 
+  // ── SchemaElement ─────────────────────────────────────────────────────────────
+
   private readSchemaElement(): SchemaElement {
     const el: SchemaElement = { name: '', type: null, numChildren: 0 };
     let lastId = 0;
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       switch (id) {
         case 1:
@@ -325,14 +341,14 @@ export class ThriftReader {
     return el;
   }
 
+  // ── RowGroup ──────────────────────────────────────────────────────────────────
+
   private readRowGroup(): RowGroup {
     const rg: RowGroup = { columns: [], totalBytes: 0, numRows: 0 };
     let lastId = 0;
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       switch (id) {
         case 1:
@@ -351,15 +367,16 @@ export class ThriftReader {
     return rg;
   }
 
+  // ── ColumnChunk ───────────────────────────────────────────────────────────────
+
   private readColumnChunk(): ColumnChunkParsed {
     let fileOffset = 0;
     let meta: ColumnMetaData | null = null;
     let lastId = 0;
+
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       switch (id) {
         case 2:
@@ -372,7 +389,6 @@ export class ThriftReader {
           this.skipValue(type);
       }
     }
-
     return {
       name: meta?.pathInSchema.join('.') ?? 'unknown',
       type: meta?.type ?? 'UNKNOWN',
@@ -385,6 +401,8 @@ export class ThriftReader {
       dictOffset: meta?.dictionaryPageOffset ?? null,
     };
   }
+
+  // ── ColumnMetaData ────────────────────────────────────────────────────────────
 
   private readColumnMetaData(): ColumnMetaData {
     const meta: ColumnMetaData = {
@@ -401,9 +419,7 @@ export class ThriftReader {
     let lastId = 0;
     while (true) {
       const { type, id } = this.readFieldHeader(lastId);
-      if (type === CompactType.STOP) {
-        break;
-      }
+      if (type === CompactType.STOP) {break;}
       lastId = id;
       switch (id) {
         case 1:
@@ -433,8 +449,11 @@ export class ThriftReader {
         case 11:
           meta.dictionaryPageOffset = this.readZigZag64();
           break;
+        // Fields 8 (key_value_metadata), 10 (index_page_offset),
+        // 12+ (statistics, encoding_stats, bloom_filter, size_statistics...)
         default:
           this.skipValue(type);
+          break;
       }
     }
     return meta;

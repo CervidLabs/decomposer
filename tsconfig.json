@@ -3,21 +3,20 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
     "strict": true,
-    "declaration": true,
-    "emitDeclarationOnly": true,
-    "declarationMap": false,
-    "outDir": "./dist-types",
-    "allowJs": true,
-    "checkJs": false,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
-    "resolveJsonModule": true,
-    "isolatedModules": false,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "skipLibCheck": true,
+    "exactOptionalPropertyTypes": true,
+    "lib": ["ES2022"],
+    
+    "types": ["node", "vitest/globals"] 
   },
-  "include": ["src/**/*.js", "src/**/*.d.ts"],
-  "exclude": ["node_modules", "dist", "coverage"]
+  "include": ["src/**/*","test/**/*", "archive/sort.worker.js", "archive/join.worker.js", "archive/nitro.worker.js", "archive/groupby.worker.js", "archive/filter.worker.js", "archive/count.worker.js"],
+  "exclude": ["node_modules", "dist", "**/*.spec.ts", "**/*.test.ts"]
 }
